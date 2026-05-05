@@ -17,8 +17,8 @@
 #define VOICE_STATE_STOP 0
 #endif
 
-#define MUSIC_BUFFER_SIZE (256*1024)
-#define MUSIC_BUFFERS 2
+#define MUSIC_BUFFER_SIZE (32*1024)
+#define MUSIC_BUFFERS 16
 #define MAX_SAMPLE_VOICES 16
 #define USER_CB_BUFFER_SIZE 4096 
 
@@ -35,6 +35,8 @@ static lwpq_t music_queue;
 static u32 music_sampleRate = 44100;
 static u8 music_vol_l = 128;
 static u8 music_vol_r = 128;
+static volatile int music_is_ready = 0; 
+static volatile int buffer_locked[MUSIC_BUFFERS];
 
 static AESNDPB* sample_voices[MAX_SAMPLE_VOICES];
 static int next_voice_index = 0;
@@ -185,7 +187,7 @@ void GCSound_UnregisterUserCallback() {
     }
 }
 
-static void _loadMusicChunk(int index) {
+/*static void _loadMusicChunk(int index) {
     u32 i;
     u16 *ptr;
     size_t read;
@@ -201,24 +203,94 @@ static void _loadMusicChunk(int index) {
         ptr[i] = (ptr[i] << 8) | (ptr[i] >> 8);
     }
     DCFlushRange(music_buffers[index], MUSIC_BUFFER_SIZE);
+}*/
+
+
+static void _loadMusicChunk(int index) {
+    if (!musicFile || index < 0 || index >= MUSIC_BUFFERS) return;
+
+    size_t read = fread(music_buffers[index], 1, MUSIC_BUFFER_SIZE, musicFile);
+    
+    // Si llegamos al final del archivo, hacemos el loop
+    if (read < MUSIC_BUFFER_SIZE) {
+        fseek(musicFile, music_dataOffset, SEEK_SET);
+        // Leemos lo que falta para completar el buffer
+        fread((u8*)music_buffers[index] + read, 1, MUSIC_BUFFER_SIZE - read, musicFile);
+    }
+
+    // SWAP DE BYTES OPTIMIZADO
+    // Procesamos de 32 bits en 32 bits (dos muestras a la vez) para ir más rápido
+    u32 *ptr32 = (u32*)music_buffers[index];
+    u32 i;
+    for (i = 0; i < MUSIC_BUFFER_SIZE / 4; i++) {
+        // Esto cambia los bytes de 0xAABBCCDD a 0xBBAADDCC en una sola operación
+        u32 val = ptr32[i];
+        ptr32[i] = ((val << 8) & 0xFF00FF00) | ((val >> 8) & 0x00FF00FF);
+    }
+
+    // ¡CRÍTICO! Aseguramos que la RAM tenga los datos finales antes de que el audio los pida
+    DCFlushRange(music_buffers[index], MUSIC_BUFFER_SIZE);
 }
 
-static void _musicCallback(AESNDPB *pb, u32 state) {
+/*static void _musicCallback(AESNDPB *pb, u32 state) {
     if (state == VOICE_STATE_STREAM && music_keep_playing && !music_is_paused) {
         music_active_buffer = (music_active_buffer + 1) % MUSIC_BUFFERS;
         AESND_SetVoiceBuffer(pb, music_buffers[music_active_buffer], MUSIC_BUFFER_SIZE);
         music_fill_next = (music_active_buffer + 1) % MUSIC_BUFFERS;
         LWP_ThreadSignal(music_queue);
     }
+}*/
+
+static void _musicCallback(AESNDPB *pb, u32 state) {
+    if (state == VOICE_STATE_STREAM && music_keep_playing && !music_is_paused) {
+        // 1. Guardamos el que acabamos de terminar
+        int finished_buffer = music_active_buffer;
+        
+        // 2. Apuntamos AL SIGUIENTE para el hardware
+        music_active_buffer = (music_active_buffer + 1) % MUSIC_BUFFERS;
+        
+        // 3. Le damos el nuevo buffer al hardware de inmediato
+        AESND_SetVoiceBuffer(pb, music_buffers[music_active_buffer], MUSIC_BUFFER_SIZE);
+        
+        // 4. AHORA avisamos al hilo que rellene el que ya soltamos
+        music_fill_next = finished_buffer;
+        LWP_ThreadSignal(music_queue);
+    }
 }
 
-static void* _music_thread_func(void* arg) {
+/*static void* _music_thread_func(void* arg) {
     while (music_keep_playing) {
         LWP_ThreadSleep(music_queue);
         if (music_fill_next != -1 && music_keep_playing) {
             int b = music_fill_next;
             music_fill_next = -1;
             _loadMusicChunk(b);
+        }
+    }
+    return NULL;
+}*/
+
+
+
+static void* _music_thread_func(void* arg) {
+    int i;
+    for(i = 0; i < MUSIC_BUFFERS; i++) {
+        buffer_locked[i] = 0;
+        _loadMusicChunk(i);
+    }
+    music_is_ready = 1;
+
+    while (music_keep_playing) {
+        LWP_ThreadSleep(music_queue);
+        
+        if (music_keep_playing && music_fill_next != -1) {
+            int b = music_fill_next;
+            music_fill_next = -1;
+            
+            // Solo cargamos si el hardware no está en este buffer
+            if (b != music_active_buffer) {
+                _loadMusicChunk(b);
+            }
         }
     }
     return NULL;
@@ -242,7 +314,7 @@ void GCSound_Close() {
     }
 }
 
-int GCSound_PlayMusic(const char* filename, u32 forceFrequency) {
+/*int GCSound_PlayMusic(const char* filename, u32 forceFrequency) {
     char id[4];
     u32 rate = 44100;
     u16 chans = 2;
@@ -282,7 +354,75 @@ int GCSound_PlayMusic(const char* filename, u32 forceFrequency) {
     AESND_SetVoiceBuffer(music_voice, music_buffers[0], MUSIC_BUFFER_SIZE);
     AESND_SetVoiceStop(music_voice, false);
     return 1;
+}*/
+
+
+int GCSound_PlayMusic(const char* filename, u32 forceFrequency) {
+    char id[4];
+    u32 rate = 44100;
+    u16 chans = 2;
+    
+    GCSound_StopMusic();
+    
+    // Abrimos el archivo (recuerda: sin prefijo sd:/)
+    musicFile = fopen(filename, "rb");
+    if (!musicFile) return 0;
+    
+    // Leemos la cabecera WAV para obtener rate y chans
+    fseek(musicFile, 12, SEEK_SET);
+    while (fread(id, 1, 4, musicFile) == 4) {
+        u32 chunkSize;
+        fread(&chunkSize, 4, 1, musicFile);
+        u32 realSize = _swap32(chunkSize);
+        if (memcmp(id, "fmt ", 4) == 0) {
+            fseek(musicFile, 2, SEEK_CUR);
+            fread(&chans, 2, 1, musicFile);
+            fread(&rate, 4, 1, musicFile);
+            chans = _swap16(chans);
+            rate = _swap32(rate);
+            fseek(musicFile, realSize - 8, SEEK_CUR);
+        } else if (memcmp(id, "data", 4) == 0) {
+            music_dataOffset = ftell(musicFile);
+            break;
+        } else {
+            fseek(musicFile, (realSize + (realSize % 2)), SEEK_CUR);
+        }
+    }
+
+    // Configuración de estado
+    music_sampleRate = (forceFrequency > 0) ? forceFrequency : rate;
+    music_keep_playing = true;
+    music_is_paused = false;
+    music_active_buffer = 0;
+    music_fill_next = -1;
+    music_is_ready = 0; // El hilo la pondrá en 1 al terminar de cargar
+
+    // 1. Iniciamos el hilo de carga
+    LWP_CreateThread(&music_thread, _music_thread_func, NULL, NULL, 16384, 65);
+
+    // 2. Espera de Sincronización: Máximo 100ms para llenar los 10 buffers
+    int timeout = 0;
+    while(!music_is_ready && timeout < 100) {
+        usleep(1000); 
+        timeout++;
+    }
+
+    // 3. Activamos el audio
+    music_voice = AESND_AllocateVoice(_musicCallback);
+    if (music_voice) {
+        AESND_SetVoiceStream(music_voice, true);
+        AESND_SetVoiceFrequency(music_voice, music_sampleRate);
+        AESND_SetVoiceFormat(music_voice, (chans == 2 ? VOICE_STEREO16 : VOICE_MONO16));
+        AESND_SetVoiceVolume(music_voice, music_vol_l, music_vol_r);
+        
+        // El hilo ya llenó el buffer 0, así que lo asignamos
+        AESND_SetVoiceBuffer(music_voice, music_buffers[0], MUSIC_BUFFER_SIZE);
+        AESND_SetVoiceStop(music_voice, false);
+    }
+
+    return 1;
 }
+
 
 void GCSound_PauseMusic(int paused) {
     if (!music_voice) return;
