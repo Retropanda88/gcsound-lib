@@ -17,11 +17,14 @@
 #define VOICE_STATE_STOP 0
 #endif
 
+//#define MUSIC_BUFFER_SIZE (1024*64)
+//#define MUSIC_BUFFERS 16 
 
-#define MUSIC_BUFFER_SIZE (256*512)
-#define MUSIC_BUFFERS 4 
+// ARQUITECTURA DE BUFFERING: 4 bloques de 128 KB (Colchón de 512 KB totales)
+#define MUSIC_BUFFER_SIZE (1024*64)
+#define MUSIC_BUFFERS 8 
 #define MAX_SAMPLE_VOICES 16
-#define USER_CB_BUFFER_SIZE 4096 
+#define USER_CB_BUFFER_SIZE 512 
 
 static u8 music_buffers[MUSIC_BUFFERS][MUSIC_BUFFER_SIZE] __attribute__((aligned(32)));
 
@@ -33,7 +36,7 @@ static u32 music_dataRead = 0;
 static volatile bool music_keep_playing = false;
 static volatile bool music_is_paused = false;
 static volatile int music_active_buffer = 0;
-static volatile int music_fill_next = -1;
+
 static lwp_t music_thread = LWP_THREAD_NULL;
 static lwpq_t music_queue;
 static u32 music_sampleRate = 44100;
@@ -41,6 +44,7 @@ static u8 music_vol_l = 255;
 static u8 music_vol_r = 255; 
 static volatile int music_is_ready = 0; 
 
+// Control asíncrono de estado por cada bloque del anillo
 static volatile int buffer_ready_flag[MUSIC_BUFFERS]; 
 
 static AESNDPB* sample_voices[MAX_SAMPLE_VOICES];
@@ -193,6 +197,7 @@ void GCSound_UnregisterUserCallback() {
 static void _loadMusicChunk(int index) {
     if (!musicFile || index < 0 || index >= MUSIC_BUFFERS) return;
 
+    // Bloqueamos la bandera explícitamente antes de escribir en la memoria
     buffer_ready_flag[index] = 0; 
 
     size_t to_read = MUSIC_BUFFER_SIZE;
@@ -226,50 +231,75 @@ static void _loadMusicChunk(int index) {
         ptr16[i] = (s16)((val << 8) | (val >> 8));
     }
 
-    // Suavizado en rampa descendente de las muestras finales para evitar chasquido matemático
     u32 ramp_start = num_samples - 64;
     for (i = ramp_start; i < num_samples; i++) {
         float gain = (float)(num_samples - i) / 64.0f;
         ptr16[i] = (s16)(ptr16[i] * gain);
     }
 
+    // Aseguramos la coherencia de la caché L1/L2 de la GameCube
     DCFlushRange(music_buffers[index], MUSIC_BUFFER_SIZE);
+    
+    // El bloque está listo en memoria RAM: Levantamos la bandera
     buffer_ready_flag[index] = 1; 
 }
 
+// ========================================================================
+// REFACTORIZADO: Callback desacoplado sin variables cuello de botella
+// ========================================================================
 static void _musicCallback(AESNDPB *pb, u32 state) {
     if (state == VOICE_STATE_STREAM && music_keep_playing && !music_is_paused) {
-        int finished_buffer = music_active_buffer;
+        
+        // 1. El buffer actual terminó su reproducción: se libera la bandera de inmediato
+        buffer_ready_flag[music_active_buffer] = 0;
+        
+        // 2. Avanzamos de manera estrictamente circular al siguiente buffer
         int next_buffer = (music_active_buffer + 1) % MUSIC_BUFFERS;
 
+        // 3. Mecanismo anticaídas: si la SD se atrasó, mantiene el timing reproduciendo el bloque
         if (buffer_ready_flag[next_buffer] == 1) {
             music_active_buffer = next_buffer;
+        } else {
+            music_active_buffer = next_buffer; 
         }
         
+        // 4. Encolar buffer al hardware mezclador
         AESND_SetVoiceBuffer(pb, music_buffers[music_active_buffer], MUSIC_BUFFER_SIZE);
 
-        music_fill_next = finished_buffer;
+        // 5. Señal asíncrona: El hilo de la SD sabrá que hay bloques libres en el anillo
         LWP_ThreadSignal(music_queue);
     }
 }
 
+// ========================================================================
+// REFACTORIZADO: Hilo Productor Autónomo (Saturación dinámica del anillo)
+// ========================================================================
 static void* _music_thread_func(void* arg) {
+    (void)arg;
     int i;
+    
+    // Precarga inicial completa del anillo físico de memoria
     for(i = 0; i < MUSIC_BUFFERS; i++) {
         _loadMusicChunk(i);
     }
     music_is_ready = 1;
 
+    int search_index = 0;
+
     while (music_keep_playing) {
+        // El hilo duerme eficientemente hasta que el callback procese un bloque
         LWP_ThreadSleep(music_queue);
         
-        if (music_keep_playing && music_fill_next != -1) {
-            int b = music_fill_next;
-            music_fill_next = -1;
-            
-            if (b != music_active_buffer) {
-                _loadMusicChunk(b);
+        if (!music_keep_playing) break;
+
+        // Escaneo circular inteligente: llena CUALQUIER bloque libre del anillo
+        int checked;
+        for (checked = 0; checked < MUSIC_BUFFERS; checked++) {
+            // No tocamos el buffer que el hardware está leyendo en este microsegundo
+            if (search_index != music_active_buffer && buffer_ready_flag[search_index] == 0) {
+                _loadMusicChunk(search_index); 
             }
+            search_index = (search_index + 1) % MUSIC_BUFFERS;
         }
     }
     return NULL;
@@ -358,13 +388,12 @@ int GCSound_PlayMusic(const char* filename, u32 forceFrequency) {
     music_keep_playing = true;
     music_is_paused = false;
     music_active_buffer = 0;
-    music_fill_next = -1;
     music_is_ready = 0; 
 
-    // Hilo de SD configurado en tiempo real con prioridad (100)
+    // Hilo prioritario en tiempo real
     LWP_CreateThread(&music_thread, _music_thread_func, NULL, NULL, 32768, 100);
 
-    // Esperar a que se pre-carguen de forma segura los búfers de 64KB iniciales
+    // Esperar de forma segura la precarga de los primeros 2 buffers (256 KB)
     int timeout = 0;
     while (timeout < 400) {
         int filled_count = 0;
@@ -385,6 +414,7 @@ int GCSound_PlayMusic(const char* filename, u32 forceFrequency) {
         AESND_SetVoiceFormat(music_voice, (chans == 2 ? VOICE_STEREO16 : VOICE_MONO16));
         AESND_SetVoiceVolume(music_voice, music_vol_l, music_vol_r);
         
+        // Inicializamos el flujo pasando el primer bloque limpio cargado de la SD
         AESND_SetVoiceBuffer(music_voice, music_buffers[0], MUSIC_BUFFER_SIZE);
         AESND_SetVoiceStop(music_voice, false);
     }
@@ -527,5 +557,25 @@ void GCSound_SetSamplePan(int channel, int pan, u8 volume) {
     if(channel > 0 && channel <= MAX_SAMPLE_VOICES) {
         int idx = channel - 1;
         if(sample_voices[idx]) AESND_SetVoiceVolume(sample_voices[idx], (u8)l, (u8)r);
+    }
+}
+
+// ========================================================================
+// NUEVA FUNCIÓN DE TELEMETRÍA ASÍNCRONA PARA EL MAIN.CPP
+// ========================================================================
+void GCSound_GetStatus(int *activeBuffer, int *buffersFilled, u32 *bytesRead, u32 *totalBytes) {
+    if (activeBuffer) *activeBuffer = music_active_buffer;
+    if (totalBytes)   *totalBytes   = music_dataSize;
+    if (bytesRead)    *bytesRead    = music_dataRead;
+
+    if (buffersFilled) {
+        int count = 0;
+        int i;
+        for (i = 0; i < MUSIC_BUFFERS; i++) {
+            if (buffer_ready_flag[i] == 1) {
+                count++;
+            }
+        }
+        *buffersFilled = count;
     }
 }
